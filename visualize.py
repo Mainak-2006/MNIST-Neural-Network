@@ -21,7 +21,6 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")                   # render to file, no display needed
 import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
 
 import data
 from models import load_model, as_model_input
@@ -127,27 +126,6 @@ def main():
     ax.set_title("Training curves")
     lines = ax.get_lines() + ax2.get_lines()
     ax.legend(lines, [l.get_label() for l in lines], loc="center right")
-
-    # Box out train loss, train acc, and test acc on the graph
-    loss_vals = history["train_loss"]
-    loss_min, loss_max = float(np.min(loss_vals)), float(np.max(loss_vals))
-    pad_loss = 0.08 * max(1e-6, loss_max - loss_min)
-    ax.add_patch(Rectangle((epochs[0] - 0.3, loss_min - pad_loss),
-                           epochs[-1] - epochs[0] + 0.6, loss_max - loss_min + 2 * pad_loss,
-                           edgecolor="tab:red", linewidth=2, facecolor="none", zorder=10))
-
-    train_acc_vals = history["train_acc"] * 100
-    test_acc_vals = history["test_acc"] * 100
-    pad_acc = 0.5
-    tmin, tmax = float(np.min(train_acc_vals)), float(np.max(train_acc_vals))
-    ax2.add_patch(Rectangle((epochs[0] - 0.3, tmin - pad_acc),
-                            epochs[-1] - epochs[0] + 0.6, tmax - tmin + 2 * pad_acc,
-                            edgecolor="tab:blue", linewidth=2, facecolor="none", zorder=10))
-
-    smin, smax = float(np.min(test_acc_vals)), float(np.max(test_acc_vals))
-    ax2.add_patch(Rectangle((epochs[0] - 0.3, smin - pad_acc),
-                            epochs[-1] - epochs[0] + 0.6, smax - smin + 2 * pad_acc,
-                            edgecolor="tab:green", linewidth=2, facecolor="none", zorder=10))
 
     # 3. misclassified test images -----------------------------------------
     preds = model.predict(as_model_input(model, x_test))
