@@ -30,7 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import data
-from network import MLP
+from models import load_model, as_model_input
 
 GREEN = "#2ca02c"
 RED = "#d62728"
@@ -72,7 +72,7 @@ def run_batch(args, model):
     x_batch = x_test[idx]                     # (n, 784)
     labels = y_test[idx]
 
-    probs = model.predict_proba(x_batch)      # (n, 10)  <-- one batched pass
+    probs = model.predict_proba(as_model_input(model, x_batch))   # one batched pass
     preds = probs.argmax(axis=1)
     conf = probs[np.arange(n), labels]        # probability of the true class
     correct = preds == labels
@@ -181,7 +181,7 @@ def run_images(args, model):
     os.makedirs(args.out_dir, exist_ok=True)
     for path in args.image:
         vec = load_image(path, invert=invert, center=args.center)
-        probs = model.predict_proba(vec.reshape(1, -1))[0]
+        probs = model.predict_proba(as_model_input(model, vec.reshape(1, -1)))[0]
         pred = int(probs.argmax())
 
         print(f"\n{path}")
@@ -208,7 +208,7 @@ def run_images(args, model):
 
 def main():
     args = parse_args()
-    model = MLP.load(args.model)
+    model = load_model(args.model)
     if args.image:
         run_images(args, model)
     else:

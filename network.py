@@ -90,6 +90,51 @@ class ReLU:
         return dA * self.mask
 
 
+class Dropout:
+    """Randomly zeroes each activation with probability `p` during training.
+
+    Dropout is a regulariser: by hiding a random subset of units every step,
+    no unit can rely on a particular partner being present, so the network
+    learns redundant, more robust features and overfits less.
+
+    We use *inverted* dropout: at train time, units that survive are scaled
+    by 1 / (1 - p) so the expected activation is unchanged. That means
+    inference is just the identity -- no scaling bookkeeping at test time.
+
+        train:  mask ~ Bernoulli(1 - p);  out = x * mask / (1 - p)
+        eval:   out = x
+
+    The backward pass re-uses the same mask and scale, routing gradient only
+    through the units that were kept.
+    """
+
+    def __init__(self, p=0.5, rng=None):
+        self.p = p
+        self.rng = rng or np.random.default_rng(0)
+        self.training = True
+        self.mask = None
+
+    def train(self, mode=True):
+        self.training = mode
+        return self
+
+    def eval(self):
+        return self.train(False)
+
+    def forward(self, x):
+        if not self.training or self.p <= 0.0:
+            self.mask = None
+            return x
+        keep = 1.0 - self.p
+        self.mask = (self.rng.random(x.shape) < keep) / keep
+        return x * self.mask
+
+    def backward(self, dA):
+        if self.mask is None:
+            return dA
+        return dA * self.mask
+
+
 class SoftmaxCrossEntropy:
     """Softmax followed by cross-entropy loss, computed together.
 
@@ -129,22 +174,46 @@ class MLP:
     Example: MLP([784, 256, 128, 10]) builds
         784 -> Linear+ReLU -> Linear+ReLU -> Linear(10) -> softmax+CE
     Note the last Linear has no ReLU before the loss.
+
+    With dropout > 0 a Dropout layer is inserted after every hidden ReLU
+    (never before the logits). Call .train() / .eval() to switch dropout on
+    and off; inference methods do this automatically.
     """
 
-    def __init__(self, layer_sizes, seed=0):
+    def __init__(self, layer_sizes, seed=0, dropout=0.0):
         rng = np.random.default_rng(seed)
         self.layer_sizes = list(layer_sizes)
+        self.dropout = float(dropout)
+        self.training = True
         self.layers = []
         for i in range(len(layer_sizes) - 1):
             self.layers.append(Linear(layer_sizes[i], layer_sizes[i + 1], rng))
             if i < len(layer_sizes) - 2:      # no ReLU after the final layer
                 self.layers.append(ReLU())
+                if self.dropout > 0.0:
+                    # Dropout only on the hidden activations, never the logits.
+                    self.layers.append(Dropout(self.dropout, rng))
         self.loss_fn = SoftmaxCrossEntropy()
 
     # -- shapes helpers -----------------------------------------------------
     @property
     def weight_layers(self):
         return [l for l in self.layers if isinstance(l, Linear)]
+
+    @property
+    def dropout_layers(self):
+        return [l for l in self.layers if isinstance(l, Dropout)]
+
+    # -- train / eval mode --------------------------------------------------
+    def train(self, mode=True):
+        """Turn dropout (and any future stochastic layers) on or off."""
+        self.training = mode
+        for layer in self.dropout_layers:
+            layer.training = mode
+        return self
+
+    def eval(self):
+        return self.train(False)
 
     # -- forward / backward -------------------------------------------------
     def forward(self, x):
@@ -162,18 +231,27 @@ class MLP:
 
     def predict(self, x):
         # argmax of the logits equals argmax of the softmax probabilities.
-        return self.forward(x).argmax(axis=1)
+        return self._eval_forward(x).argmax(axis=1)
 
     def predict_proba(self, x):
         """Return class probabilities, shape (N, 10).
 
         Applies a numerically stable softmax to the logits. Works on any
-        batch size N in a single vectorised forward pass.
+        batch size N in a single vectorised forward pass. Always runs in
+        eval mode so dropout never perturbs a prediction.
         """
-        logits = self.forward(x)
+        logits = self._eval_forward(x)
         z = logits - logits.max(axis=1, keepdims=True)
         e = np.exp(z)
         return e / e.sum(axis=1, keepdims=True)
+
+    def _eval_forward(self, x):
+        """Forward pass with dropout disabled, restoring the previous mode."""
+        was_training = self.training
+        self.eval()
+        out = self.forward(x)
+        self.train(was_training)
+        return out
 
 
     def accuracy(self, x, y):
@@ -188,12 +266,15 @@ class MLP:
             arrays[f"W{i}"] = layer.W
             arrays[f"b{i}"] = layer.b
         arrays["layer_sizes"] = np.array(self.layer_sizes)
+        arrays["dropout"] = np.array(self.dropout)
+        arrays["kind"] = np.array("mlp")
         np.savez(path, **arrays)
 
     @classmethod
     def load(cls, path):
         data = np.load(path)
-        model = cls(data["layer_sizes"].tolist())
+        dropout = float(data["dropout"]) if "dropout" in data else 0.0
+        model = cls(data["layer_sizes"].tolist(), dropout=dropout)
         for i, layer in enumerate(model.weight_layers):
             layer.W = data[f"W{i}"]
             layer.b = data[f"b{i}"]
@@ -214,15 +295,27 @@ class SGDMomentum:
     cancel while the along-valley components reinforce, so we move faster
     and more smoothly toward the minimum.
 
+    With nesterov=True we use Nesterov accelerated momentum: we take the
+    step using the gradient evaluated a little *ahead* of the current point,
+    which looks before it leaps and damps overshoot near the minimum.
+
+        v     <- momentum * v + grad
+        param <- param - lr * (grad + momentum * v)
+
+    (Here `grad` is still the gradient at the current parameter, matching
+    the single forward/backward pass per step that the training loop does.)
+
     weight_decay adds L2 regularisation: it shrinks weights slightly each
     step, discouraging large weights and reducing overfitting.
     """
 
-    def __init__(self, params, lr=0.1, momentum=0.9, weight_decay=0.0):
+    def __init__(self, params, lr=0.1, momentum=0.9, weight_decay=0.0,
+                 nesterov=False):
         self.params = params
         self.lr = lr
         self.momentum = momentum
         self.weight_decay = weight_decay
+        self.nesterov = nesterov
         self.v = {id(p): (np.zeros_like(p.W), np.zeros_like(p.b)) for p in params}
 
     def step(self):
@@ -230,10 +323,16 @@ class SGDMomentum:
             gW = p.dW + self.weight_decay * p.W
             gb = p.db
             vW, vb = self.v[id(p)]
-            vW = self.momentum * vW - self.lr * gW
-            vb = self.momentum * vb - self.lr * gb
-            p.W += vW
-            p.b += vb
+            if self.nesterov:
+                vW = self.momentum * vW + gW
+                vb = self.momentum * vb + gb
+                p.W -= self.lr * (gW + self.momentum * vW)
+                p.b -= self.lr * (gb + self.momentum * vb)
+            else:
+                vW = self.momentum * vW - self.lr * gW
+                vb = self.momentum * vb - self.lr * gb
+                p.W += vW
+                p.b += vb
             self.v[id(p)] = (vW, vb)
 
 
@@ -286,11 +385,12 @@ class Adam:
             self.v[id(p)] = (vW, vb)
 
 
-def make_optimizer(name, params, lr, momentum=0.9, weight_decay=0.0):
+def make_optimizer(name, params, lr, momentum=0.9, weight_decay=0.0,
+                   nesterov=False):
     name = name.lower()
     if name == "sgd":
         return SGDMomentum(params, lr=lr, momentum=momentum,
-                           weight_decay=weight_decay)
+                           weight_decay=weight_decay, nesterov=nesterov)
     if name == "adam":
         return Adam(params, lr=lr, weight_decay=weight_decay)
     raise ValueError(f"unknown optimiser: {name!r} (use 'sgd' or 'adam')")
